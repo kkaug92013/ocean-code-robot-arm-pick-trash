@@ -1,0 +1,411 @@
+/* Edge Impulse Arduino examples
+ * Copyright (c) 2022 EdgeImpulse Inc.
+ * Modified for ESP32-S3 WROOM - STABLE VERSION WITH FIXED MEMORY MANAGEMENT
+ */
+
+#include <Hackathon_inferencing.h>
+#include "edge-impulse-sdk/dsp/image/image.hpp"
+#include "esp_camera.h"
+#include <ESP32Servo.h>
+
+// ESP32-S3 WROOM Camera Configuration
+#define CAMERA_MODEL_ESP32S3_EYE
+
+#if defined(CAMERA_MODEL_ESP32S3_EYE)
+#define PWDN_GPIO_NUM -1
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 15
+#define SIOD_GPIO_NUM 4
+#define SIOC_GPIO_NUM 5
+
+#define Y2_GPIO_NUM 11
+#define Y3_GPIO_NUM 9
+#define Y4_GPIO_NUM 8
+#define Y5_GPIO_NUM 10
+#define Y6_GPIO_NUM 12
+#define Y7_GPIO_NUM 18
+#define Y8_GPIO_NUM 17
+#define Y9_GPIO_NUM 16
+
+#define VSYNC_GPIO_NUM 6
+#define HREF_GPIO_NUM 7
+#define PCLK_GPIO_NUM 13
+#else
+#error "Camera model not selected"
+#endif
+
+// Hardware Configuration
+#define SERVO_PIN 2 // Servo on GPIO pin 2
+#define SERVO_MIN_ANGLE 10      
+#define SERVO_MAX_ANGLE 170     
+#define SERVO_CENTER_ANGLE 90     
+#define LED_PIN 48 // Built-in LED
+
+// Timing Configuration
+#define DETECTION_TIMEOUT 1000 // Return to center after 1 second of no detection
+#define LED_BLINK_INTERVAL 250    
+#define LOOP_DELAY 200 // Slower loop for stability
+
+/* Edge Impulse Constants */
+#define EI_CAMERA_RAW_FRAME_BUFFER_COLS 320
+#define EI_CAMERA_RAW_FRAME_BUFFER_ROWS 240
+#define EI_CAMERA_FRAME_BYTE_SIZE 3
+#define DETECTION_THRESHOLD 0.5 // Higher threshold for more reliable detection
+
+/* Global variables */
+static bool debug_nn = false;
+static bool is_initialised = false;
+
+// Allocate buffer statically to avoid heap issues
+static uint8_t ei_camera_frame_buffer[EI_CAMERA_RAW_FRAME_BUFFER_COLS * EI_CAMERA_RAW_FRAME_BUFFER_ROWS * EI_CAMERA_FRAME_BYTE_SIZE];
+static uint8_t *snapshot_buf = ei_camera_frame_buffer;
+
+// Servo and LED state
+Servo myServo;
+unsigned long lastDetectionTime = 0;
+bool objectDetected = false;
+int currentServoAngle = SERVO_CENTER_ANGLE;
+
+// LED state
+unsigned long lastLedToggle = 0;
+bool ledState = false;
+
+static camera_config_t camera_config = {
+    .pin_pwdn = PWDN_GPIO_NUM,
+    .pin_reset = RESET_GPIO_NUM,
+    .pin_xclk = XCLK_GPIO_NUM,
+    .pin_sscb_sda = SIOD_GPIO_NUM,
+    .pin_sscb_scl = SIOC_GPIO_NUM,
+
+    .pin_d7 = Y9_GPIO_NUM,
+    .pin_d6 = Y8_GPIO_NUM,
+    .pin_d5 = Y7_GPIO_NUM,
+    .pin_d4 = Y6_GPIO_NUM,
+    .pin_d3 = Y5_GPIO_NUM,
+    .pin_d2 = Y4_GPIO_NUM,
+    .pin_d1 = Y3_GPIO_NUM,
+    .pin_d0 = Y2_GPIO_NUM,
+    .pin_vsync = VSYNC_GPIO_NUM,
+    .pin_href = HREF_GPIO_NUM,
+    .pin_pclk = PCLK_GPIO_NUM,
+
+    .xclk_freq_hz = 20000000,
+    .ledc_timer = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+
+    .pixel_format = PIXFORMAT_JPEG,
+    .frame_size = FRAMESIZE_QVGA,
+    .jpeg_quality = 12,
+    .fb_count = 1,
+    .fb_location = CAMERA_FB_IN_PSRAM,
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+};
+
+/* Function declarations */
+bool ei_camera_init(void);
+void ei_camera_deinit(void);
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf);
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr);
+void moveServoToAngle(int angle);
+int mapObjectToServoAngle(float objectX);
+void updateLED(void);
+void returnToCenter(void);
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(2000); // Give everything time to stabilize
+    
+    Serial.println("\n=== ESP32-S3 Object Tracking System - STABLE VERSION ===");
+    
+    // Check PSRAM
+    if(!psramFound()){
+        Serial.println("ERROR: PSRAM not found!");
+        while(1) delay(1000);
+    }
+    Serial.printf("PSRAM Size: %d bytes\n", ESP.getPsramSize());
+    
+    // Initialize LED
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+    Serial.println("✓ LED initialized");
+    
+    // Initialize servo with simple setup
+    myServo.attach(SERVO_PIN);
+    delay(100);
+    myServo.write(SERVO_CENTER_ANGLE);
+    delay(500); // Give servo time to move to center
+    Serial.printf("✓ Servo initialized at %d degrees\n", SERVO_CENTER_ANGLE);
+    
+    // Test servo briefly
+    Serial.println("Testing servo...");
+    myServo.write(SERVO_MIN_ANGLE);
+    delay(1000);
+    myServo.write(SERVO_MAX_ANGLE);
+    delay(1000);
+    myServo.write(SERVO_CENTER_ANGLE);
+    delay(1000);
+    Serial.println("✓ Servo test complete");
+    
+    // Initialize camera
+    Serial.println("Initializing camera...");
+    if (ei_camera_init() == false) {
+        Serial.println("ERROR: Camera initialization failed!");
+        while(1) {
+            digitalWrite(LED_PIN, HIGH);
+            delay(200);
+            digitalWrite(LED_PIN, LOW);
+            delay(200);
+        }
+    }
+    Serial.println("✓ Camera initialized");
+    
+    // Ready signal
+    Serial.println("\n=== SYSTEM READY ===");
+    Serial.printf("Detection threshold: %.1f\n", DETECTION_THRESHOLD);
+    Serial.printf("Loop delay: %d ms\n", LOOP_DELAY);
+    
+    // Blink LED to show ready
+    for(int i = 0; i < 5; i++) {
+        digitalWrite(LED_PIN, HIGH);
+        delay(100);
+        digitalWrite(LED_PIN, LOW);
+        delay(100);
+    }
+    
+    Serial.println("Starting object detection...\n");
+}
+
+void loop()
+{
+    // Update LED blinking
+    updateLED();
+    
+    // Check if we should return to center
+    if (objectDetected && (millis() - lastDetectionTime > DETECTION_TIMEOUT)) {
+        returnToCenter();
+    }
+    
+    // Setup Edge Impulse signal
+    ei::signal_t signal;
+    signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+    signal.get_data = &ei_camera_get_data;
+
+    // Capture image
+    if (ei_camera_capture((size_t)EI_CLASSIFIER_INPUT_WIDTH, (size_t)EI_CLASSIFIER_INPUT_HEIGHT, snapshot_buf) == false) {
+        Serial.println("Image capture failed");
+        delay(LOOP_DELAY);
+        return;
+    }
+
+    // Run classification
+    ei_impulse_result_t result = { 0 };
+    EI_IMPULSE_ERROR err = run_classifier(&signal, &result, debug_nn);
+    
+    if (err != EI_IMPULSE_OK) {
+        Serial.printf("Classification failed: %d\n", err);
+        delay(LOOP_DELAY);
+        return;
+    }
+
+    // Process results
+    bool detectedThisFrame = false;
+    float bestConfidence = 0.0;
+    float bestObjectX = 0.5; // Center default
+
+#if EI_CLASSIFIER_OBJECT_DETECTION == 1
+    // Object Detection Mode
+    for (uint32_t i = 0; i < result.bounding_boxes_count; i++) {
+        ei_impulse_result_bounding_box_t bb = result.bounding_boxes[i];
+        
+        if (bb.value >= DETECTION_THRESHOLD && bb.value > bestConfidence) {
+            bestConfidence = bb.value;
+            bestObjectX = bb.x + (bb.width / 2.0); // Center of bounding box
+            detectedThisFrame = true;
+            
+            Serial.printf("DETECTED: %s (%.2f) at X=%.2f\n", bb.label, bb.value, bestObjectX);
+        }
+    }
+#else
+    // Classification Mode
+    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        if (result.classification[i].value >= DETECTION_THRESHOLD && result.classification[i].value > bestConfidence) {
+            bestConfidence = result.classification[i].value;
+            detectedThisFrame = true;
+            bestObjectX = 0.5; // Center for classification
+            
+            Serial.printf("CLASSIFIED: %s (%.2f)\n", ei_classifier_inferencing_categories[i], result.classification[i].value);
+        }
+    }
+#endif
+
+    // Handle detection
+    if (detectedThisFrame) {
+        if (!objectDetected) {
+            Serial.println("*** OBJECT DETECTED - TRACKING ***");
+        }
+        
+        // Move servo to track object
+        int targetAngle = mapObjectToServoAngle(bestObjectX);
+        moveServoToAngle(targetAngle);
+        
+        objectDetected = true;
+        lastDetectionTime = millis();
+        
+    } else if (objectDetected) {
+        // Object was detected before but not now
+        Serial.println("*** OBJECT LOST ***");
+        returnToCenter();
+    }
+    
+    delay(LOOP_DELAY); // Stable loop timing
+}
+
+/**
+ * Update LED - blink when object detected, off otherwise
+ */
+void updateLED(void) {
+    if (objectDetected) {
+        if (millis() - lastLedToggle > LED_BLINK_INTERVAL) {
+            ledState = !ledState;
+            digitalWrite(LED_PIN, ledState);
+            lastLedToggle = millis();
+        }
+    } else {
+        digitalWrite(LED_PIN, LOW);
+        ledState = false;
+    }
+}
+
+/**
+ * Move servo to specific angle
+ */
+void moveServoToAngle(int angle) {
+    angle = constrain(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+    
+    if (abs(currentServoAngle - angle) > 5) { // Only move if significant change
+        Serial.printf("Moving servo: %d° -> %d°\n", currentServoAngle, angle);
+        myServo.write(angle);
+        currentServoAngle = angle;
+    }
+}
+
+/**
+ * Map object X position (0.0 to 1.0) to servo angle
+ */
+int mapObjectToServoAngle(float objectX) {
+    objectX = constrain(objectX, 0.0, 1.0);
+    
+    // Map object position to servo angle
+    // 0.0 (left) -> SERVO_MAX_ANGLE, 1.0 (right) -> SERVO_MIN_ANGLE
+    int angle = SERVO_MAX_ANGLE - (int)(objectX * (SERVO_MAX_ANGLE - SERVO_MIN_ANGLE));
+    
+    return constrain(angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+}
+
+/**
+ * Return servo to center when no object detected
+ */
+void returnToCenter(void) {
+    if (objectDetected) {
+        Serial.println("Returning to center position");
+        moveServoToAngle(SERVO_CENTER_ANGLE);
+        objectDetected = false;
+    }
+}
+
+/**
+ * Initialize camera
+ */
+bool ei_camera_init(void) {
+    if (is_initialised) return true;
+
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed: 0x%x\n", err);
+        return false;
+    }
+
+    sensor_t * s = esp_camera_sensor_get();
+    if (s == NULL) {
+        Serial.println("Failed to get camera sensor");
+        return false;
+    }
+    
+    // Configure sensor
+    s->set_vflip(s, 1);
+    s->set_hmirror(s, 1);
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+    
+    is_initialised = true;
+    return true;
+}
+
+/**
+ * Deinitialize camera
+ */
+void ei_camera_deinit(void) {
+    esp_err_t err = esp_camera_deinit();
+    if (err != ESP_OK) {
+        return;
+    }
+    is_initialised = false;
+}
+
+/**
+ * Capture image
+ */
+bool ei_camera_capture(uint32_t img_width, uint32_t img_height, uint8_t *out_buf) {
+    if (!is_initialised) {
+        return false;
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        return false;
+    }
+
+    bool converted = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, snapshot_buf);
+    esp_camera_fb_return(fb);
+
+    if (!converted) {
+        return false;
+    }
+
+    // Resize if needed
+    if ((img_width != EI_CAMERA_RAW_FRAME_BUFFER_COLS) || (img_height != EI_CAMERA_RAW_FRAME_BUFFER_ROWS)) {
+        ei::image::processing::crop_and_interpolate_rgb888(
+            out_buf,
+            EI_CAMERA_RAW_FRAME_BUFFER_COLS,
+            EI_CAMERA_RAW_FRAME_BUFFER_ROWS,
+            out_buf,
+            img_width,
+            img_height);
+    }
+
+    return true;
+}
+
+/**
+ * Get image data for Edge Impulse
+ */
+static int ei_camera_get_data(size_t offset, size_t length, float *out_ptr)
+{
+    size_t pixel_ix = offset * 3;
+    size_t pixels_left = length;
+    size_t out_ptr_ix = 0;
+
+    while (pixels_left != 0) {
+        out_ptr[out_ptr_ix] = (snapshot_buf[pixel_ix + 2] << 16) + (snapshot_buf[pixel_ix + 1] << 8) + snapshot_buf[pixel_ix];
+        out_ptr_ix++;
+        pixel_ix += 3;
+        pixels_left--;
+    }
+    return 0;
+}
+
+#if !defined(EI_CLASSIFIER_SENSOR) || EI_CLASSIFIER_SENSOR != EI_CLASSIFIER_SENSOR_CAMERA
+#error "Invalid model for current sensor"
+#endif
